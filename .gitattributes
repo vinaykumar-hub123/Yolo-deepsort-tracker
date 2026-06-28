@@ -1,0 +1,9 @@
+# Ignore TypeScript frontend assets in GitHub language statistics so it displays as Python
+src/** linguist-vendored
+package.json linguist-vendored
+package-lock.json linguist-vendored
+tsconfig.json linguist-vendored
+vite.config.ts linguist-vendored
+index.html linguist-vendored
+metadata.json linguist-vendored
+.env.example linguist-vendored
