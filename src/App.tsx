@@ -52,6 +52,10 @@ interface SimulatedObject {
   framesLost: number;
   confidence: number;
   lifetime: number;
+  birthX?: number;
+  birthY?: number;
+  maxDisplacement?: number;
+  isConfirmed?: boolean;
 }
 
 // Predefined professional colors for classes
@@ -191,6 +195,7 @@ export default function App() {
         });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
+          setUseSimulatedWebcam(false); // Deactivate simulation if real webcam succeeds
           
           // Use onloadedmetadata to ensure we play when ready, and catch any play promise rejections safely
           videoRef.current.onloadedmetadata = () => {
@@ -223,6 +228,7 @@ export default function App() {
           setTimeout(() => {
             if (videoRef.current) {
               videoRef.current.srcObject = stream;
+              setUseSimulatedWebcam(false); // Deactivate simulation if real webcam succeeds
               videoRef.current.play().catch(() => {});
               setWebcamActive(true);
             } else {
@@ -232,10 +238,12 @@ export default function App() {
         }
       } else {
         setWebcamError("Camera capture APIs (navigator.mediaDevices.getUserMedia) are not supported or blocked in this browser/iframe context.");
+        setUseSimulatedWebcam(true);
       }
     } catch (err: any) {
-      console.error("Webcam activation error:", err);
+      console.warn("Webcam activation info (handled gracefully):", err);
       setWebcamError("Camera access denied (Permission Denied). Security policies often block camera/mic capture inside embed frames. Please click 'Import Video or Photo' below to upload any file, use 'Simulated Camera', or click 'Open in Full Tab ↗' to bypass this restriction!");
+      setUseSimulatedWebcam(true); // Automatically fall back to simulated camera feed to maintain functional state
     }
   };
 
@@ -376,7 +384,8 @@ export default function App() {
           status: "Active",
           framesLost: 0,
           confidence: 0.82 + Math.random() * 0.16,
-          lifetime: Math.floor(Math.random() * 200)
+          lifetime: Math.floor(Math.random() * 200),
+          isConfirmed: true
         });
       }
       stateRef.current.nextId += count;
@@ -408,7 +417,8 @@ export default function App() {
           status: "Active",
           framesLost: 0,
           confidence: 0.78 + Math.random() * 0.18,
-          lifetime: Math.floor(Math.random() * 150)
+          lifetime: Math.floor(Math.random() * 150),
+          isConfirmed: true
         });
       }
       stateRef.current.nextId += count;
@@ -434,7 +444,8 @@ export default function App() {
           status: "Active",
           framesLost: 0,
           confidence: 0.95 + Math.random() * 0.04,
-          lifetime: 0
+          lifetime: 0,
+          isConfirmed: true
         });
       }
       stateRef.current.nextId += count;
@@ -579,7 +590,8 @@ export default function App() {
 
           setTrackHistoryCount(prev => {
             const copy = [...prev.slice(1)];
-            copy.push(stateRef.current.objects.filter(o => o.status === "Active").length);
+            const confirmedActiveCount = stateRef.current.objects.filter(o => o.status === "Active" && o.isConfirmed === true).length;
+            copy.push(confirmedActiveCount);
             return copy;
           });
 
@@ -590,7 +602,8 @@ export default function App() {
 
         // Mirror trackers to react state for rendering the telemetry tables
         if (stateRef.current.frameCount % 5 === 0) {
-          setActiveTrackersList([...stateRef.current.objects]);
+          const filteredList = stateRef.current.objects.filter(obj => obj.isConfirmed === true);
+          setActiveTrackersList(filteredList);
         }
 
         stateRef.current.lastTime = now;
@@ -941,7 +954,8 @@ export default function App() {
     ctx.fillStyle = "#94a3b8";
     ctx.fillText("TRACKS ACT : ", 22, 86);
     ctx.fillStyle = "#eab308";
-    ctx.fillText(`${stateRef.current.objects.filter(o => o.status === "Active").length} units`, 110, 86);
+    const activeConfirmedCount = stateRef.current.objects.filter(o => o.status === "Active" && o.isConfirmed === true).length;
+    ctx.fillText(`${activeConfirmedCount} units`, 110, 86);
     
     // Tiny telemetry logo decoration in upper right
     ctx.strokeStyle = "rgba(56, 189, 248, 0.4)";
@@ -1168,12 +1182,37 @@ export default function App() {
     // 2. Perform frame-differencing with previous frame
     const prevFrameData = stateRef.current.prevFrameData;
     const motionPixels: { x: number; y: number }[] = [];
+    const motionGrid = new Uint8Array(sampleW * sampleH);
+    const motionIndices: number[] = [];
 
     if (prevFrameData) {
-      const threshold = 22; // Sensibility
+      // Step A: Determine the level of raw global frame differences to identify noise/camera shake/heavy rain
+      let rawDiffCount = 0;
+      let sumDiff = 0;
+      for (let i = 0; i < sampleW * sampleH; i++) {
+        const d = Math.abs(gray[i] - prevFrameData.data[i]);
+        sumDiff += d;
+        if (d > 15) {
+          rawDiffCount++;
+        }
+      }
+      
+      const avgDiff = sumDiff / (sampleW * sampleH);
+
+      // Adaptively scale threshold up if there's high global activity (e.g. raindrops, wind, shake)
+      // This ensures we only capture high-contrast localized movement (e.g. people, cars)
+      let threshold = 22;
+      if (rawDiffCount > 1500 || avgDiff > 8) {
+        threshold = 36; // High noise suppression
+      } else if (rawDiffCount > 700 || avgDiff > 5) {
+        threshold = 28; // Medium noise suppression
+      }
+
       for (let i = 0; i < sampleW * sampleH; i++) {
         const diff = Math.abs(gray[i] - prevFrameData.data[i]);
         if (diff > threshold) {
+          motionGrid[i] = 1;
+          motionIndices.push(i);
           const y = Math.floor(i / sampleW);
           const x = i % sampleW;
           motionPixels.push({ x: x * stepX, y: y * stepY });
@@ -1191,71 +1230,115 @@ export default function App() {
     };
 
     // 3. Cluster motion pixels into raw bounding boxes (Detection Stage)
-    // Simple greedy density box builder
     const detectionsList: { x1: number; y1: number; x2: number; y2: number; size: number }[] = [];
-    const minPixelDensity = 12; // Minimum motion particles to warrant a bbox
 
-    if (motionPixels.length > minPixelDensity) {
-      // Find bounding box enclosing the overall major motion cluster
-      let minX = width, maxX = 0, minY = height, maxY = 0;
-      motionPixels.forEach(p => {
-        if (p.x < minX) minX = p.x;
-        if (p.x > maxX) maxX = p.x;
-        if (p.y < minY) minY = p.y;
-        if (p.y > maxY) maxY = p.y;
-      });
-
-      const clusterW = maxX - minX;
-      const clusterH = maxY - minY;
-
-      // Add a bounding box if it matches standard human sizing profiles
-      if (clusterW > 35 && clusterH > 35) {
-        // Enlarge slightly for buffer padding
-        detectionsList.push({
-          x1: Math.max(0, minX - 10),
-          y1: Math.max(0, minY - 10),
-          x2: Math.min(width, maxX + 10),
-          y2: Math.min(height, maxY + 10),
-          size: motionPixels.length
-        });
-      }
-
-      // Add supplementary smaller cluster trackers for hands/objects
-      if (motionPixels.length > 60) {
-        // Divide frame left/right and extract secondary boxes if active
-        const midX = (minX + maxX) / 2;
-        let leftMinX = width, leftMaxX = 0, leftMinY = height, leftMaxY = 0;
-        let rightMinX = width, rightMaxX = 0, rightMinY = height, rightMaxY = 0;
-        let leftCount = 0, rightCount = 0;
-
-        motionPixels.forEach(p => {
-          if (p.x < midX) {
-            leftCount++;
-            if (p.x < leftMinX) leftMinX = p.x;
-            if (p.x > leftMaxX) leftMaxX = p.x;
-            if (p.y < leftMinY) leftMinY = p.y;
-            if (p.y > leftMaxY) leftMaxY = p.y;
-          } else {
-            rightCount++;
-            if (p.x < rightMinX) rightMinX = p.x;
-            if (p.x > rightMaxX) rightMaxX = p.x;
-            if (p.y < rightMinY) rightMinY = p.y;
-            if (p.y > rightMaxY) rightMaxY = p.y;
+    // Filter out isolated noise pixels (e.g. raindrops, sensor artifacts) using a 3x3 density check
+    const filteredGrid = new Uint8Array(sampleW * sampleH);
+    for (let i = 0; i < motionIndices.length; i++) {
+      const idx = motionIndices[i];
+      const cx = idx % sampleW;
+      const cy = Math.floor(idx / sampleW);
+      
+      let count = 0;
+      for (let dy = -1; dy <= 1; dy++) {
+        const ny = cy + dy;
+        if (ny < 0 || ny >= sampleH) continue;
+        for (let dx = -1; dx <= 1; dx++) {
+          const nx = cx + dx;
+          if (nx < 0 || nx >= sampleW) continue;
+          if (motionGrid[ny * sampleW + nx]) {
+            count++;
           }
-        });
-
-        if (leftCount > minPixelDensity && (leftMaxX - leftMinX) > 25) {
-          detectionsList.push({
-            x1: leftMinX, y1: leftMinY, x2: leftMaxX, y2: leftMaxY, size: leftCount
-          });
         }
-        if (rightCount > minPixelDensity && (rightMaxX - rightMinX) > 25) {
-          detectionsList.push({
-            x1: rightMinX, y1: rightMinY, x2: rightMaxX, y2: rightMaxY, size: rightCount
+      }
+      
+      // Increased to 4 to filter out isolated raindrop particles/flickers
+      if (count >= 4) {
+        filteredGrid[idx] = 1;
+      }
+    }
+
+    // BFS-based distance clustering of motion pixels to detect distinct objects
+    const visited = new Uint8Array(sampleW * sampleH);
+    const clusters: { minX: number; maxX: number; minY: number; maxY: number; count: number }[] = [];
+    const searchDist = 2; // Reduced from 3 to prevent merging separate people/vehicles across empty space
+
+    for (let i = 0; i < sampleW * sampleH; i++) {
+      if (filteredGrid[i] && !visited[i]) {
+        let cMinX = i % sampleW;
+        let cMaxX = cMinX;
+        let cMinY = Math.floor(i / sampleW);
+        let cMaxY = cMinY;
+        let pCount = 0;
+
+        const queue: number[] = [i];
+        visited[i] = 1;
+
+        let qHead = 0;
+        while (qHead < queue.length) {
+          const curr = queue[qHead++];
+          const cx = curr % sampleW;
+          const cy = Math.floor(curr / sampleW);
+
+          pCount++;
+          if (cx < cMinX) cMinX = cx;
+          if (cx > cMaxX) cMaxX = cx;
+          if (cy < cMinY) cMinY = cy;
+          if (cy > cMaxY) cMaxY = cy;
+
+          for (let dy = -searchDist; dy <= searchDist; dy++) {
+            const ny = cy + dy;
+            if (ny < 0 || ny >= sampleH) continue;
+            for (let dx = -searchDist; dx <= searchDist; dx++) {
+              const nx = cx + dx;
+              if (nx < 0 || nx >= sampleW) continue;
+              
+              const nIdx = ny * sampleW + nx;
+              if (filteredGrid[nIdx] && !visited[nIdx]) {
+                visited[nIdx] = 1;
+                queue.push(nIdx);
+              }
+            }
+          }
+        }
+
+        // Only keep clusters with sufficient motion footprint to represent real objects
+        if (pCount >= 8) {
+          clusters.push({
+            minX: cMinX,
+            maxX: cMaxX,
+            minY: cMinY,
+            maxY: cMaxY,
+            count: pCount
           });
         }
       }
     }
+
+    // Convert clusters to 640x360 canvas space
+    clusters.forEach(c => {
+      const x1 = c.minX * stepX;
+      const y1 = c.minY * stepY;
+      const x2 = c.maxX * stepX;
+      const y2 = c.maxY * stepY;
+
+      const clusterW = x2 - x1;
+      const clusterH = y2 - y1;
+
+      // Filter out tiny clusters, and guard against full-screen boxes (camera shaking, wind, or global rain)
+      // Realistic pedestrians or street vehicles should not exceed 40% width / 45% height of the frame
+      const maxAllowedW = width * 0.40;
+      const maxAllowedH = height * 0.45;
+      if (clusterW > 18 && clusterH > 18 && clusterW < maxAllowedW && clusterH < maxAllowedH) {
+        detectionsList.push({
+          x1: Math.max(0, x1 - 5),
+          y1: Math.max(0, y1 - 5),
+          x2: Math.min(width, x2 + 5),
+          y2: Math.min(height, y2 + 5),
+          size: c.count
+        });
+      }
+    });
 
     // Inject simulated image detections for static uploaded images
     if (uploadedMediaType === "image") {
@@ -1354,6 +1437,53 @@ export default function App() {
         trk.history.push({ x: cx, y: cy });
         if (trk.history.length > 20) trk.history.shift();
 
+        // Calculate displacement from birth position to filter out static objects
+        if (trk.birthX === undefined || trk.birthY === undefined) {
+          trk.birthX = cx;
+          trk.birthY = cy;
+          trk.maxDisplacement = 0;
+        } else {
+          const dist = Math.sqrt(Math.pow(cx - trk.birthX, 2) + Math.pow(cy - trk.birthY, 2));
+          if (dist > (trk.maxDisplacement || 0)) {
+            trk.maxDisplacement = dist;
+          }
+        }
+
+        // Require track to show evidence of movement to confirm it as a moving object
+        const boxW = trk.x2 - trk.x1;
+        const boxH = trk.y2 - trk.y1;
+        const size = Math.max(boxW, boxH);
+        
+        // Far-away objects have small bounding boxes. Their motion displacement is smaller in pixel space.
+        // Near objects have larger bounding boxes and move faster in pixel space.
+        let reqDisplacement = 12;
+        if (size < 25) {
+          reqDisplacement = 4;   // Far objects (cars or pedestrians at a distance)
+        } else if (size < 45) {
+          reqDisplacement = 7;   // Medium-far
+        } else if (size < 80) {
+          reqDisplacement = 10;  // Medium
+        }
+
+        const requiredHits = Math.max(3, minHits);
+        const currentDisplacement = trk.maxDisplacement || 0;
+        
+        // A track is considered moving if its max displacement is above the size-based threshold,
+        // or if it has existed for a while and shows at least some persistent progress.
+        const isMoving = currentDisplacement >= reqDisplacement || (trk.lifetime >= 8 && currentDisplacement >= 5);
+
+        if (!trk.isConfirmed && trk.lifetime >= requiredHits && isMoving) {
+          trk.isConfirmed = true;
+          // Increment stats counts ONLY when the track is first confirmed!
+          setTotalObjectsCount(prev => prev + 1);
+          setClassCounts(prev => {
+            return {
+              ...prev,
+              [trk.className]: (prev[trk.className] || 0) + 1
+            };
+          });
+        }
+
         updatedObjects.push(trk);
       } else {
         // No match found: Object goes into Lost/Prediction mode
@@ -1378,61 +1508,90 @@ export default function App() {
       }
     });
 
-    // 5. Create new Trackers for unmatched detections
-    detectionsList.forEach((det, dIdx) => {
-      if (matchedDetectionsIndices.has(dIdx)) return;
+    // 5. Create new Trackers for unmatched detections (only if there is no global camera shake)
+    const isGlobalShake = motionIndices.length > 1000;
+    if (!isGlobalShake) {
+      detectionsList.forEach((det, dIdx) => {
+        if (matchedDetectionsIndices.has(dIdx)) return;
 
-      // Ensure minimum scale density check to prevent noise initiation
-      if (det.size > minPixelDensity * 2.5) {
-        const id = stateRef.current.webcamTrackerId++;
-        const width = det.x2 - det.x1;
-        const aspect = width / (det.y2 - det.y1);
-        
-        // Dynamic labels based on size/aspect ratio
-        let label = "Object";
-        if (width > 220) label = "Person";
-        else if (aspect > 1.2) label = "Hand";
-        else if (width > 80 && width <= 220) label = "Face";
+        // Ensure minimum scale density check to prevent noise initiation
+        if (det.size >= 8) {
+          const id = stateRef.current.webcamTrackerId++;
+          const boxW = det.x2 - det.x1;
+          const boxH = det.y2 - det.y1;
+          const aspect = boxW / boxH;
+          
+          // Dynamic labels based on size/aspect ratio (optimized for street scenes and general movement)
+          let label = "Object";
+          if (aspect < 0.65) {
+            // Slim vertical shape is almost always a pedestrian (Person)
+            label = "Person";
+          } else if (aspect >= 0.65 && aspect < 1.05) {
+            // Narrow horizontal or square: check width to distinguish Person vs Bicycle/Motorcycle
+            if (boxW < 45) {
+              label = "Bicycle";
+            } else {
+              label = "Person";
+            }
+          } else if (aspect >= 1.05 && aspect < 2.5) {
+            // Standard horizontal profile (Car vs Truck)
+            if (boxW > 130) {
+              label = "Truck";
+            } else {
+              label = "Car";
+            }
+          } else if (aspect >= 2.5) {
+            // Wide horizontal profile is typically a heavy vehicle (Truck)
+            label = "Truck";
+          } else {
+            label = "Object";
+          }
 
-        const color = CLASS_COLORS[label] || "#38bdf8";
+          // Completely skip background "Object" items to prevent tracking scenery elements
+          if (label === "Object") {
+            return;
+          }
 
-        // Add tracker
-        updatedObjects.push({
-          id: id,
-          classId: label === "Person" ? 0 : label === "Face" ? 12 : 39,
-          className: label,
-          x1: det.x1,
-          y1: det.y1,
-          x2: det.x2,
-          y2: det.y2,
-          targetX: det.x1,
-          targetY: det.y1,
-          speed: 1,
-          direction: 0,
-          color: color,
-          history: [{ x: (det.x1 + det.x2) / 2, y: (det.y1 + det.y2) / 2 }],
-          status: "Active",
-          framesLost: 0,
-          confidence: Math.min(0.98, 0.72 + (det.size / 500)),
-          lifetime: 1
-        });
+          const color = CLASS_COLORS[label] || "#38bdf8";
+          const cx = (det.x1 + det.x2) / 2;
+          const cy = (det.y1 + det.y2) / 2;
 
-        // Increment stats counts
-        setTotalObjectsCount(prev => prev + 1);
-        setClassCounts(prev => {
-          const cLabel = label === "Face" ? "Bicycle" : label === "Hand" ? "Truck" : label; // Map to base counts categories for simpler bar chart
-          return {
-            ...prev,
-            [cLabel]: (prev[cLabel] || 0) + 1
-          };
-        });
-      }
-    });
+          // Add tracker (unconfirmed initially until it has active frames and actual motion displacement)
+          updatedObjects.push({
+            id: id,
+            classId: label === "Person" ? 0 : label === "Car" ? 2 : label === "Truck" ? 7 : label === "Bicycle" ? 1 : 39,
+            className: label,
+            x1: det.x1,
+            y1: det.y1,
+            x2: det.x2,
+            y2: det.y2,
+            targetX: det.x1,
+            targetY: det.y1,
+            speed: 1,
+            direction: 0,
+            color: color,
+            history: [{ x: cx, y: cy }],
+            status: "Active",
+            framesLost: 0,
+            confidence: Math.min(0.98, 0.72 + (det.size / 500)),
+            lifetime: 1,
+            birthX: cx,
+            birthY: cy,
+            maxDisplacement: 0,
+            isConfirmed: false
+          });
+        }
+      });
+    }
 
     stateRef.current.objects = updatedObjects;
 
+    // --- DRAW REGION OF INTEREST (ROI) ZONE ---
     // 6. DRAW Overlays on top of webcam stream
     stateRef.current.objects.forEach(obj => {
+      // ONLY draw if the object track is confirmed as a moving object
+      if (obj.isConfirmed !== true) return;
+
       const w = obj.x2 - obj.x1;
       const h = obj.y2 - obj.y1;
 
